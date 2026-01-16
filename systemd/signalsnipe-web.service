@@ -1,0 +1,17 @@
+[Unit]
+Description=SignalSnipe Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signalsnipe
+Group=signalsnipe
+ExecStart=/opt/signalsnipe/run-web.sh
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

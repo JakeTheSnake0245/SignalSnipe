@@ -14,6 +14,81 @@ import uuid
 CONFIG_PATH = os.environ.get("SIGNALSNIPE_CONFIG", "/etc/signalsnipe/config.json")
 LOG_PATH = os.environ.get("SIGNALSNIPE_LOG", "/var/log/signalsnipe/signalsnipe.log")
 
+ERROR_PATH = os.environ.get("SIGNALSNIPE_ERROR", "/var/log/signalsnipe/errors.jsonl")
+
+def _err(tag: str, msg: str, **kv):
+    # Silent error sink (JSONL). Never throws.
+    try:
+        import json
+        rec = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "tag": tag, "msg": msg}
+        rec.update(kv or {})
+        with open(ERROR_PATH, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _split_hosts(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        # split on comma/space/semicolon
+        parts = re.split(r"[,\s;]+", v.strip())
+        return [p for p in (x.strip() for x in parts) if p]
+    return [str(v).strip()] if str(v).strip() else []
+
+def _targets(section: dict, default_port: int = 4242):
+    """
+    Returns list[(host,port)].
+    Accepts:
+      - section.targets = [{"host": "...", "port": 4242}, ...]
+      - section.udp_hosts = ["ip1","ip2"] (or string)
+      - section.udp_host  = "ip1,ip2 ip3"
+    """
+    sec = section or {}
+    out = []
+
+    t = sec.get("targets")
+    if isinstance(t, list):
+        for row in t:
+            if isinstance(row, dict):
+                h = str(row.get("host","") or "").strip()
+                if not h:
+                    continue
+                p = row.get("port", default_port)
+                try:
+                    p = int(p)
+                except Exception:
+                    p = default_port
+                out.append((h, p))
+
+    # If no explicit targets, fall back to udp_hosts/udp_host + udp_port
+    if not out:
+        hosts = sec.get("udp_hosts", None)
+        if hosts is None:
+            hosts = sec.get("udp_host", None)
+        host_list = _split_hosts(hosts)
+        p = sec.get("udp_port", default_port)
+        try:
+            p = int(p)
+        except Exception:
+            p = default_port
+        out = [(h, p) for h in host_list]
+
+    # De-dupe while preserving order
+    seen = set()
+    dedup = []
+    for h,p in out:
+        key = (h,p)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((h,p))
+    return dedup
+
+
 def log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = f"{ts} {msg}"
@@ -88,12 +163,19 @@ def cot_xml(cfg, text: str):
 def send_cot(cfg, text: str):
     if not cfg.get("cot", {}).get("enabled", True):
         return
-    host = cfg["cot"].get("udp_host", "127.0.0.1")
-    port = int(cfg["cot"].get("udp_port", 4242))
+    cot_sec = cfg.get("cot", {}) or {}
+    targets = _targets(cot_sec, 4242)
+    if not targets:
+        return
+
     payload = cot_xml(cfg, text)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.sendto(payload, (host, port))
-    s.close()
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(payload, (host, int(port)))
+            s.close()
+        except Exception as e:
+            _err("send_cot", "send failed", host=host, port=port, err=repr(e))
 
 
 
@@ -106,9 +188,8 @@ def send_geochat_hit(cfg, text: str):
     if not chat.get("enabled", False):
         return
 
-    host = str(chat.get("udp_host", "")).strip()
-    port = int(chat.get("udp_port", 4242) or 4242)
-    if not host:
+    targets = _targets(chat, 4242)
+    if not targets:
         return
 
     room = str(chat.get("chatroom", "SignalSnipe")).strip() or "SignalSnipe"
@@ -148,11 +229,30 @@ def send_geochat_hit(cfg, text: str):
     )
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.sendto(xml.encode("utf-8"), (host, port))
+    for host, port in targets:
+        try:
+            s.sendto(xml.encode("utf-8"), (host, int(port)))
+        except Exception as e:
+            _err("send_geochat", "send failed", host=host, port=port, err=repr(e))
     s.close()
 def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int, gain_db: float, ppm: int):
+    """
+    Reliable rtl_power wrapper:
+    - write output to a temp file (avoids stdout buffering / partial capture issues)
+    - enforce runtime with `timeout`
+    - parse last CSV line even if rtl_power gets killed
+    """
+    import tempfile, os
+
+    # Some rtl_power builds don't exit reliably with -1 on certain USB stacks.
+    # So we run it for a fixed window and parse the file it wrote.
+    timeout_s = max(8, int(integration_s) + 7)
+
     # rtl_power output lines look like:
     # date, time, start, end, step, samples, p0, p1, p2, ...
+    with tempfile.NamedTemporaryFile(prefix="signalsnipe_rtlpower_", suffix=".csv", delete=False) as tf:
+        out_path = tf.name
+
     cmd = [
         "rtl_power",
         "-f", f"{start_hz}:{end_hz}:{step_hz}",
@@ -160,44 +260,61 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
         "-1",
         "-p", str(ppm),
         "-g", str(gain_db),
-        "-"
+        out_path,
     ]
 
-    # IMPORTANT:
-    # Some rtl_power builds do NOT exit reliably even with -1.
-    # If we block here, we never parse, never DETECT, never send.
-    # So: enforce a timeout, parse partial stdout if needed.
-    timeout_s = max(6, int(integration_s) + 5)
-
-    out_text = ""
+    # Run rtl_power without piping stdout into Python (prevents ctrl+c blocking in stdout.read()).
+    # Manage lifetime ourselves so systemd stop / ctrl+c is deterministic.
+    import signal
+    err = b""
     try:
-        p = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_s
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
         )
-        out_text = p.stdout or ""
-        rc = p.returncode
-    except subprocess.TimeoutExpired as ex:
-        # subprocess.run() kills the process on timeout; we still can parse what it printed.
-        out_text = (ex.stdout or "") if isinstance(ex.stdout, str) else (ex.stdout.decode("utf-8","ignore") if ex.stdout else "")
-        rc = 124
+        try:
+            err = (proc.communicate(timeout=timeout_s + 2)[1] or b"")
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                err = (proc.communicate(timeout=2)[1] or b"")
+            except Exception:
+                err = b""
+        rc = proc.returncode if proc.returncode is not None else -9
+    except KeyboardInterrupt:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        raise
 
-    out = (out_text.strip().splitlines() if out_text else [])
+    try:
+        data = open(out_path, "r", errors="ignore").read().splitlines()
+    finally:
+        try: os.remove(out_path)
+        except Exception: pass
 
     # Find last CSV-like line
     csv_line = None
-    for line in reversed(out):
-        if "," in line and line.count(",") > 6:
+    for line in reversed(data):
+        if "," in line and line.count(",") > 6 and line[0:4].isdigit():
             csv_line = line
             break
 
     if not csv_line:
-        # Surface something useful for logs
-        tail = "\n".join(out[-8:]) if out else "(no output)"
-        raise RuntimeError(f"rtl_power produced no CSV output (rc={rc}) tail:\n{tail}")
+        tail = "\n".join(data[-10:]) if data else "(no file output)"
+        # also include rtl_power stdout/stderr (rarely useful but sometimes)
+        out_text = ""
+        try:
+            out_text = (err or b"").decode("utf-8","ignore").strip()
+        except Exception:
+            pass
+        raise RuntimeError(f"rtl_power produced no CSV output (rc={rc}) filetail:\n{tail}\nproc_err:\n{out_text}")
 
     parts = [x.strip() for x in csv_line.split(",")]
     start = float(parts[2]); end = float(parts[3]); step = float(parts[4])
@@ -291,9 +408,19 @@ def main():
                         last_alert[key] = now
                         consecutive[key] = 0
 
+        except KeyboardInterrupt:
+
+            log("[SignalSnipe] stop requested")
+
+            return
+
+
         except Exception as e:
             log(f"[SignalSnipe] ERROR: {e}")
             time.sleep(2)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
