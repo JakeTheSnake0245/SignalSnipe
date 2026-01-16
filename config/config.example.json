@@ -1,0 +1,60 @@
+{
+  "chat": {
+    "chatroom": "SignalSnipe",
+    "enabled": true,
+    "from_callsign": "SignalSnipe",
+    "to_uid": "",
+    "udp_host": "TAK_SERVER_IP_HERE",
+    "udp_port": 4242
+  },
+  "cot": {
+    "callsign": "SS001",
+    "enabled": true,
+    "udp_host": "TAK_SERVER_IP_HERE",
+    "udp_port": 4242,
+    "uid_prefix": "SIGNALSNIPE"
+  },
+  "detect": {
+    "simulate": false,
+    "test_mode": false,
+    "threshold_db": -15
+  },
+  "device": {
+    "biastee": false,
+    "gain_db": 5.0,
+    "gain_mode": "manual",
+    "ppm": 4,
+    "type": "rtlsdr"
+  },
+  "location": {
+    "lat": 35.0,
+    "lon": -78.0,
+    "mgrs": "18S UF 98871 58177",
+    "mode": "manual_mgrs"
+  },
+  "meta": {
+    "antenna": "-3db whip",
+    "notes": "",
+    "sensor_name": "SignalSnipe001"
+  },
+  "scan": {
+    "cooldown_s": 1,
+    "integration_s": 1,
+    "min_dur_s": 1,
+    "min_duration_s": 4,
+    "ranges": [
+      {
+        "end_hz": 102000000,
+        "label": "PTT",
+        "start_hz": 99000000
+      }
+    ],
+    "step_hz": 250000,
+    "threshold_dbfs": -17.5
+  },
+  "web": {
+    "auth_token": "",
+    "bind": "0.0.0.0",
+    "port": 8088
+  }
+}

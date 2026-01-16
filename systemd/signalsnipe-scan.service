@@ -1,0 +1,18 @@
+[Unit]
+Description=SignalSnipe RF Scanner (rtl_power + detection + CoT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signalsnipe
+Group=signalsnipe
+ExecStart=/opt/signalsnipe/run-scan.sh
+Restart=always
+RestartSec=2
+Nice=-5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
