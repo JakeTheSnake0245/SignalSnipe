@@ -1,3 +1,5 @@
+<img width="2510" height="1393" alt="image" src="https://github.com/user-attachments/assets/a2de2f79-c628-46b6-b5ea-58a01f0a1ade" />
+
 # SignalSnipe
 
 RF scanner that uses `rtl_power` for sweeping and emits TAK CoT + GeoChat UDP messages.
