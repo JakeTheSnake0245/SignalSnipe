@@ -153,7 +153,7 @@ def cot_xml(cfg, text: str):
     remarks = text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
     return (
-        f'<event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" '
+        f'<event version="2.0" uid="{uid}" type="b-m-p-s-p-loc" how="m-g" '
         f'time="{t}" start="{t}" stale="{stale_t}">'
         f'<point lat="{lat}" lon="{lon}" hae="9999999" ce="9999999" le="9999999"/>'
         f'<detail><contact callsign="{callsign}"/>'

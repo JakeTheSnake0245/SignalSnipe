@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os
+import json, os, re, subprocess, shutil
 from flask import Flask, request, redirect, url_for, render_template_string
 
 
@@ -23,6 +23,53 @@ def _dedupe_targets(targets):
     return out
 
 CONFIG_PATH = os.environ.get("SIGNALSNIPE_CONFIG", "/etc/signalsnipe/config.json")
+
+def _run_ok(cmd, timeout=1.2):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, text=True)
+        out = (p.stdout or "") + "\n" + (p.stderr or "")
+        return (p.returncode == 0), out
+    except Exception:
+        return False, ""
+
+def detect_sdr_type(current="rtlsdr"):
+    """
+    Fast-ish detection.
+    - If one device present -> return it.
+    - If both present -> return current (avoid flipping).
+    - If none -> return current.
+    """
+    has_hackrf = False
+    has_rtl = False
+
+    # Prefer native tools if installed
+    if shutil.which("hackrf_info"):
+        ok, out = _run_ok(["hackrf_info"], timeout=1.2)
+        if ok and ("Found HackRF" in out or "hackrf" in out.lower()):
+            has_hackrf = True
+    else:
+        ok, out = _run_ok(["bash","-lc","lsusb | grep -i -E 'hackrf|1d50:6089'"], timeout=1.2)
+        if ok and out.strip():
+            has_hackrf = True
+
+    if shutil.which("rtl_test"):
+        ok, out = _run_ok(["rtl_test","-t"], timeout=1.2)
+        # rtl_test prints "Found 1 device(s)" even when it exits nonzero sometimes; treat that as present
+        if ("Found 1 device" in out) or ("Found " in out and "device(s)" in out):
+            has_rtl = True
+    else:
+        ok, out = _run_ok(["bash","-lc","lsusb | grep -i -E 'rtl2832|2838|0bda:2838|realtek'"], timeout=1.2)
+        if ok and out.strip():
+            has_rtl = True
+
+    if has_hackrf and not has_rtl:
+        return "hackrf"
+    if has_rtl and not has_hackrf:
+        return "rtlsdr"
+    if has_hackrf and has_rtl:
+        return (current or "rtlsdr").lower()
+    return (current or "rtlsdr").lower()
+
 
 def load_cfg():
     with open(CONFIG_PATH, "r") as f:
@@ -212,6 +259,52 @@ TPL = r"""
   .mhz-suffix::after { top: 42px; }
 }
 
+
+/* --- Mobile layout improvements --- */
+@media (max-width: 720px) {
+  body { margin: 10px; }
+  .row { grid-template-columns: 1fr !important; }
+  /* Stack CoT/Chat target rows (they use inline flex + fixed widths) */
+  #cotTargetsList .row, #chatTargetsList .row {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+  #cotTargetsList .row input, #chatTargetsList .row input {
+    width: 100% !important;
+  }
+  #cotTargetsList .row button, #chatTargetsList .row button {
+    width: 100% !important;
+  }
+}
+
+
+/* --- Desktop pro layout --- */
+@media (min-width: 721px) {
+  body { max-width: 1100px; margin: 18px auto; }
+  .card { padding: 16px; }
+  .card h2 { font-size: 1.05rem; letter-spacing: .2px; }
+  .row { gap: 18px; align-items: start; }
+  label { margin-top: 10px; }
+  input, select, textarea { font-variant-numeric: tabular-nums; }
+  .actionsbar {
+    position: sticky;
+    top: 12px;
+    z-index: 50;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 10px 12px;
+    margin: 12px 0;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: linear-gradient(180deg, rgba(16,24,20,.96) 0%, rgba(15,20,17,.96) 100%);
+    box-shadow: 0 8px 22px rgba(0,0,0,.35);
+    backdrop-filter: blur(6px);
+  }
+  .actionsbar .mini { margin-left: auto; }
+}
+
 </style>
 </head>
 <body>
@@ -225,6 +318,13 @@ TPL = r"""
 
   <form method="post" action="/save" id="cfgForm">
 
+  <div class="actionsbar">
+    <button type="submit">Save</button>
+    <button formaction="/test" formmethod="post" type="submit" class="danger">Send Test CoT</button>
+    <div class="mini">Desktop quick actions (sticky)</div>
+  </div>
+
+
     <div class="card">
       <h2 style="margin:0 0 6px 0;">RF Scan</h2>
 
@@ -233,9 +333,22 @@ TPL = r"""
           <label>Integration (seconds)</label>
           <input name="integration_s" value="{{cfg['scan']['integration_s']}}" type="number" min="1" step="1"/>
           <label>Step (Hz)</label>
-          <input name="step_hz" value="{{cfg['scan']['step_hz']}}" type="number" min="1000" step="1000"/>
+            <select name="step_hz" id="step_hz_select" data-devtype="{{cfg['device'].get('type','rtlsdr')}}">
+              <!-- RTL-SDR clean steps -->
+              <optgroup label="RTL-SDR (clean)">
+                {% for v in [1000,2000,5000,10000,12500,25000,50000,100000,125000,200000,250000,500000,1000000] %}
+                <option value="{{v}}" {% if cfg['scan']['step_hz']==v %}selected{% endif %}>{{v}}</option>
+                {% endfor %}
+              </optgroup>
+              <!-- HackRF clean steps -->
+              <optgroup label="HackRF (clean)">
+                {% for v in [100000,200000,250000,500000,1000000,2000000,5000000] %}
+                <option value="{{v}}" {% if cfg['scan']['step_hz']==v %}selected{% endif %}>{{v}}</option>
+                {% endfor %}
+              </optgroup>
+            </select>
           <label>Threshold (dB)</label>
-          <input name="threshold_dbfs" value="{{cfg['scan']['threshold_dbfs']}}" type="number" step="0.5"/>
+            <input name="threshold_dbfs" id="threshold_dbfs" value="{{cfg['scan']['threshold_dbfs']}}" type="text" inputmode="decimal" placeholder="-17.0"/>
         </div>
 
         <div>
@@ -352,7 +465,7 @@ TPL = r"""
               <div class="row" style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
                 <input name="cot_target_host" value="{{ t.get('host','') }}" placeholder="IP/Host" style="flex:1;" />
                 <input name="cot_target_port" value="{{ t.get('port', 4242) }}" type="number" step="1" style="width:8rem;" />
-                <button type="button" class="btn" onclick="removeRow(this)">Remove</button>
+                <button type="button" class="btn" onclick="_ss_removeRow(this)">Remove</button>
               </div>
               {% endfor %}
             </div>
@@ -399,7 +512,7 @@ TPL = r"""
               <div class="row" style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.35rem;">
                 <input name="chat_target_host" value="{{ t.get('host','') }}" placeholder="IP/Host" style="flex:1;" />
                 <input name="chat_target_port" value="{{ t.get('port', 4242) }}" type="number" step="1" style="width:8rem;" />
-                <button type="button" class="btn" onclick="removeRow(this)">Remove</button>
+                <button type="button" class="btn" onclick="_ss_removeRow(this)">Remove</button>
               </div>
               {% endfor %}
             </div>
@@ -419,7 +532,98 @@ TPL = r"""
 
 
 <script>
-function _ss_removeRow(btn){
+
+  // --- Frequency range add/remove (fix broken Add Range button) ---
+  function addRange(){
+    var c = document.getElementById("rangesContainer");
+    if(!c){ return; }
+    var idx = c.querySelectorAll(".range-row").length + 1;
+    var div = document.createElement("div");
+    div.className = "range-row";
+    div.innerHTML =
+      '<h3>Range ' + idx + '</h3>' +
+      '<div class="range-grid">' +
+        '<div class="mhz-suffix">' +
+          '<label>Start</label>' +
+          '<input name="range_start_mhz" value="" inputmode="decimal" placeholder="e.g. 30.000"/>' +
+        '</div>' +
+        '<div class="mhz-suffix">' +
+          '<label>End</label>' +
+          '<input name="range_end_mhz" value="" inputmode="decimal" placeholder="e.g. 88.000"/>' +
+        '</div>' +
+        '<div>' +
+          '<label>Label</label>' +
+          '<input name="range_label" value="" placeholder="e.g. VHF Low"/>' +
+        '</div>' +
+        '<div>' +
+          '<label>&nbsp;</label>' +
+          '<button type="button" class="danger" onclick="removeRange(this)">Remove</button>' +
+        '</div>' +
+      '</div>';
+    c.appendChild(div);
+  }
+
+  function removeRange(btn){
+    var n = btn;
+    while(n && !n.classList.contains("range-row")){ n = n.parentNode; }
+    if(n && n.parentNode){ n.parentNode.removeChild(n); }
+    // re-number headings
+    var rows = document.querySelectorAll("#rangesContainer .range-row h3");
+    for(var i=0;i<rows.length;i++){ rows[i].textContent = "Range " + (i+1); }
+  }
+
+  // --- Lock threshold leading '-' (prevents deleting minus) ---
+  function _lockLeadingMinus(el){
+    if(!el) return;
+    var v = (el.value || "").trim();
+    if(v === "") { el.value = "-"; return; }
+    if(v[0] !== "-") v = "-" + v.replace(/^\+/, "");
+    // allow only one leading minus
+    v = "-" + v.slice(1).replace(/-/g, "");
+    // basic cleanup: allow digits, dot, minus
+    v = v.replace(/[^0-9\.\-]/g, "");
+    // keep leading '-'
+    if(v[0] !== "-") v = "-" + v.replace(/-/g, "");
+    el.value = v;
+  }
+
+  // --- Step dropdown: prefer device-appropriate options (hide irrelevant optgroup) ---
+  function _applyStepOptions(){
+    var sel = document.getElementById("step_hz_select");
+    if(!sel) return;
+    var dev = (sel.getAttribute("data-devtype") || "rtlsdr").toLowerCase();
+    var groups = sel.getElementsByTagName("optgroup");
+    for(var i=0;i<groups.length;i++){
+      var label = (groups[i].getAttribute("label") || "").toLowerCase();
+      if(dev.indexOf("hackrf") >= 0){
+        groups[i].disabled = label.indexOf("rtl-sdr") >= 0;
+        groups[i].style.display = (label.indexOf("rtl-sdr") >= 0) ? "none" : "";
+      } else {
+        groups[i].disabled = label.indexOf("hackrf") >= 0;
+        groups[i].style.display = (label.indexOf("hackrf") >= 0) ? "none" : "";
+      }
+    }
+  }
+
+  // init on load
+  window.addEventListener("DOMContentLoaded", function(){
+    _applyStepOptions();
+    var thr = document.getElementById("threshold_dbfs");
+    if(thr){
+      _lockLeadingMinus(thr);
+      thr.addEventListener("input", function(){ _lockLeadingMinus(thr); });
+      thr.addEventListener("blur", function(){ _lockLeadingMinus(thr); });
+      thr.addEventListener("keydown", function(e){
+        // Block backspace/delete from removing the lone '-'
+        if((e.key === "Backspace" || e.key === "Delete") && (thr.value === "-" || thr.value === "")){
+          e.preventDefault();
+          thr.value = "-";
+        }
+      });
+    }
+  });
+
+  function _ss_removeRow(btn){
   var n = btn;
   while(n && n.className !== "row"){ n = n.parentNode; }
   if(n && n.parentNode){ n.parentNode.removeChild(n); }
