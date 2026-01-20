@@ -16,4 +16,4 @@ RF scanner that uses `rtl_power` for sweeping and emits TAK CoT + GeoChat UDP me
 3. Install systemd unit + enable service
 
 ## Version
-- Tag: v1.3
+- Tag: v1.5
