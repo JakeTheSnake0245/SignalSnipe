@@ -6,3 +6,13 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Backup / scratch files
+*.bak
+*.bak.*
+*.bak*
+*.BAK
+*.BAK.*
+*.BAK*
+*.swp
+*.tmp
