@@ -248,19 +248,18 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
 
     # Some rtl_power builds don't exit reliably with -1 on certain USB stacks.
     # So we run it for a fixed window and parse the file it wrote.
-    import math
+        import math
     # Estimate hop count so wide spans get enough time to complete.
-    # rtl_power typically uses ~2.5–2.8 MHz bandwidth per hop on RTL-SDR.
+    # rtl_power typically uses ~2.8 MHz bandwidth per hop on RTL-SDR.
     span_hz = max(0, int(end_hz) - int(start_hz))
     est_bw_hz = 2_800_000
     hops = max(1, math.ceil(span_hz / est_bw_hz))
-    # Give each hop at least integration_s seconds, plus overhead and flush time.
-    timeout_s = max(15, int(hops * max(1, int(integration_s))) + 12)
+    timeout_s = max(15, int(hops * max(1, int(integration_s))) + 10)
+
     with tempfile.NamedTemporaryFile(prefix="signalsnipe_rtlpower_", suffix=".csv", delete=False) as tf:
         out_path = tf.name
 
     cmd = [
-        "timeout", "-k", "30", "-s", "INT", str(timeout_s),
         "rtl_power",
         "-f", f"{start_hz}:{end_hz}:{step_hz}",
         "-i", str(integration_s),
@@ -286,7 +285,7 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
             except Exception:
                 pass
             try:
-                err = (proc.communicate(timeout=10)[1] or b"")
+                err = (proc.communicate(timeout=2)[1] or b"")
             except Exception:
                 err = b""
         rc = proc.returncode if proc.returncode is not None else -9

@@ -697,69 +697,34 @@ def index():
 def save():
     cfg = load_cfg()
 
-    # scan params (SAFE: tolerate missing/blank fields so UI can't 400)
-    cfg.setdefault("scan", {})
-    cfg.setdefault("device", {})
-    cfg.setdefault("location", {})
-    cfg.setdefault("meta", {})
-    cfg.setdefault("cot", {})
-
-    def _get(name, default=None):
-        v = request.form.get(name, None)
-        if v is None:
-            return default
-        v = str(v).strip()
-        return v if v != "" else default
-
-    def _as_int(name, default=0):
-        v = _get(name, None)
-        if v is None:
-            return int(default)
-        try:
-            return int(float(v))
-        except Exception:
-            return int(default)
-
-    def _as_float(name, default=0.0):
-        v = _get(name, None)
-        if v is None:
-            return float(default)
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    cfg["scan"]["integration_s"]  = _as_int("integration_s",  cfg["scan"].get("integration_s", 2))
-    cfg["scan"]["step_hz"]        = _as_int("step_hz",        cfg["scan"].get("step_hz", 25000))
-    cfg["scan"]["threshold_dbfs"] = _as_float("threshold_dbfs", cfg["scan"].get("threshold_dbfs", -35.0))
-
+    # scan params
+    cfg["scan"]["integration_s"] = int(request.form["integration_s"])
+    cfg["scan"]["step_hz"] = int(request.form["step_hz"])
+    cfg["scan"]["threshold_dbfs"] = float(request.form["threshold_dbfs"])
     # Keep scanner + UI compatible: scanner uses min_dur_s, older UI used min_duration_s
-    md = _as_int("min_duration_s", cfg["scan"].get("min_dur_s", cfg["scan"].get("min_duration_s", 4)))
+    md = int(request.form["min_duration_s"])
     cfg["scan"]["min_dur_s"] = md
     cfg["scan"]["min_duration_s"] = md
-    cfg["scan"]["cooldown_s"] = _as_int("cooldown_s", cfg["scan"].get("cooldown_s", 30))
+    cfg["scan"]["cooldown_s"] = int(request.form["cooldown_s"])
 
     # device params
-    cfg["device"]["ppm"] = _as_int("ppm", cfg["device"].get("ppm", 0))
-    cfg["device"]["gain_mode"] = (_get("gain_mode", cfg["device"].get("gain_mode", "manual")) or "manual").strip()
-    cfg["device"]["gain_db"] = _as_float("gain_db", cfg["device"].get("gain_db", 20.7))
+    cfg["device"]["ppm"] = int(request.form["ppm"])
+    cfg["device"]["gain_mode"] = request.form["gain_mode"]
+    cfg["device"]["gain_db"] = float(request.form["gain_db"])
 
     # location/meta
-    cfg["location"]["mgrs"] = _get("mgrs", cfg["location"].get("mgrs", "")) or ""
-    cfg["location"]["lat"]  = _as_float("lat", cfg["location"].get("lat", 0.0))
-    cfg["location"]["lon"]  = _as_float("lon", cfg["location"].get("lon", 0.0))
-    cfg["meta"]["sensor_name"] = _get("sensor_name", cfg["meta"].get("sensor_name", "SignalSnipe")) or "SignalSnipe"
-    cfg["meta"]["antenna"] = _get("antenna", cfg["meta"].get("antenna", "")) or ""
-    cfg["meta"]["notes"]   = _get("notes", cfg["meta"].get("notes", "")) or ""
+    cfg["location"]["mgrs"] = request.form["mgrs"]
+    cfg["location"]["lat"] = float(request.form["lat"])
+    cfg["location"]["lon"] = float(request.form["lon"])
+    cfg["meta"]["sensor_name"] = request.form["sensor_name"]
+    cfg["meta"]["antenna"] = request.form["antenna"]
+    cfg["meta"]["notes"] = request.form["notes"]
 
     # cot output
-    ce = (_get("cot_enabled", str(bool(cfg["cot"].get("enabled", False))).lower()) or "false").lower()
-    cfg["cot"]["enabled"] = (ce == "true")
-    cfg["cot"]["udp_host"] = _get("udp_host", cfg["cot"].get("udp_host", "")) or ""
-    cfg["cot"]["udp_port"] = _as_int("udp_port", cfg["cot"].get("udp_port", 4242))
-    cfg["cot"]["callsign"] = _get("callsign", cfg["cot"].get("callsign", "RF-SENSOR")) or "RF-SENSOR"
-
-
+    cfg["cot"]["enabled"] = (request.form["cot_enabled"].lower() == "true")
+    cfg["cot"]["udp_host"] = request.form["udp_host"]
+    cfg["cot"]["udp_port"] = int(request.form["udp_port"])
+    cfg["cot"]["callsign"] = request.form["callsign"]
     # --- Chat defaults (broadcast) ---
     cfg.setdefault("chat", {})
 
