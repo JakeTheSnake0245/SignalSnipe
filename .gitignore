@@ -16,3 +16,7 @@ venv/
 *.BAK*
 *.swp
 *.tmp
+
+# Editor temp/lock files
+.#*
+*~
