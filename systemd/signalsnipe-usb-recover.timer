@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SignalSnipe RTL-SDR USB Auto-Recovery every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

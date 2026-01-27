@@ -1,0 +1,4 @@
+# Keep RTL-SDR (0bda:2838) from autosuspending / power-saving
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", TEST=="power/autosuspend", ATTR{power/autosuspend}="-1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", TEST=="power/autosuspend_delay_ms", ATTR{power/autosuspend_delay_ms}="-1"

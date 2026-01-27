@@ -1,0 +1,21 @@
+[Unit]
+Description=SignalSnipe RF Sensor (UDP CoT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signalsnipe
+Group=signalsnipe
+EnvironmentFile=/etc/signalsnipe/signalsnipe.env
+WorkingDirectory=/opt/signalsnipe
+ExecStart=/opt/signalsnipe/run.sh
+Restart=always
+RestartSec=2
+Nice=-5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=SignalSnipe RTL-SDR USB Auto-Recovery (reset + restart on failure)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/signalsnipe-usb-recover.sh

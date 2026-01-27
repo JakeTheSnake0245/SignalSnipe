@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 import json, os, re, subprocess, shutil
 from flask import Flask, request, redirect, url_for, render_template_string
+import sys
+APP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app"))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+try:
+    from baseline import DEFAULT_BASELINE_PATH, DEFAULT_STATUS_PATH, load_baseline, save_baseline, load_status, save_status
+except Exception:
+    DEFAULT_BASELINE_PATH = "/var/lib/signalsnipe/baseline.json"
+    DEFAULT_STATUS_PATH = "/var/lib/signalsnipe/baseline_status.json"
+    def load_baseline(path=DEFAULT_BASELINE_PATH):
+        return None
+    def save_baseline(obj, path=DEFAULT_BASELINE_PATH):
+        return None
+    def load_status(path=DEFAULT_STATUS_PATH):
+        return {"state":"unknown"}
+    def save_status(state, msg="", **kv):
+        return None
+
 
 
 def _dedupe_targets(targets):
@@ -83,6 +101,31 @@ def save_cfg(cfg):
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)
     os.replace(tmp, real_path)
+
+def _newest_baseline_file():
+    # Prefer the newest baseline_*.json in /var/lib/signalsnipe (excluding status)
+    try:
+        import glob, os
+        cands = sorted(
+            [x for x in glob.glob("/var/lib/signalsnipe/baseline_*.json") if not x.endswith("baseline_status.json")],
+            key=lambda x: os.path.getmtime(x),
+            reverse=True
+        )
+        return cands[0] if cands else None
+    except Exception:
+        return None
+
+def _resolve_baseline_path(cfg):
+    cfg = cfg or {}
+    cfg.setdefault("scan", {})
+    baseline_path = str(cfg["scan"].get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+    if os.path.exists(baseline_path):
+        return baseline_path
+    nb = _newest_baseline_file()
+    if nb and os.path.exists(nb):
+        return nb
+    return baseline_path
+
 
 
 def hz_to_mhz_str(hz: int) -> str:
@@ -308,6 +351,11 @@ TPL = r"""
 </style>
 </head>
 <body>
+  <div class="btnbar">
+    <a class="navbtn" href="/">Config</a>
+    <a class="navbtn" href="/baseline">Baseline Surveys</a>
+  </div>
+
   <h1>SignalSnipe</h1>
   <div class="mini">
     <span class="pill">Night UI</span>
@@ -878,6 +926,351 @@ def test():
     s.sendto(xml, (cfg["cot"]["udp_host"], int(cfg["cot"]["udp_port"])))
     s.close()
     return redirect(url_for("index"))
+
+
+BASE_TPL = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>SignalSnipe - Baseline</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { margin: 18px; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b0f0d; color: #e6f3ea; }
+    .card { background: #101814; border: 1px solid #1f2a24; border-radius: 14px; padding: 14px; margin: 12px 0; }
+    label { display:block; margin-top:10px; color:#9fb3a7; }
+    input, select { width:100%; padding:10px; margin-top:6px; border-radius:10px; border:1px solid #1f2a24; background:#0b120e; color:#e6f3ea; }
+    .btnbar { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    button, a.btn { padding:10px 14px; border-radius:12px; border:1px solid #1f2a24; background: rgba(57, 217, 138, 0.14); color:#e6f3ea; cursor:pointer; text-decoration:none; display:inline-block; }
+    button:hover, a.btn:hover { border-color: rgba(57,217,138,.55); }
+    .danger { background: rgba(255,92,92,.12); border-color: rgba(255,92,92,.25); }
+    .danger:hover { border-color: rgba(255,92,92,.6); }
+    .pill { display:inline-block; padding:4px 10px; border:1px solid #1f2a24; border-radius:999px; color:#9fb3a7; background: rgba(255,255,255,.04); font-size:.82rem; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#0b120e; border:1px solid #1f2a24; border-radius:12px; padding:10px; color:#9fb3a7; }
+  </style>
+</head>
+<body>
+  <div class="btnbar">
+    <a class="btn" href="/">← Back to Config</a>
+    <a class="btn" href="/baseline">Refresh</a>
+    <a class="btn" href="/baseline/download">Download Baseline</a>
+      <a class="btn" href="/baseline/download_bins_csv">Download Bins CSV</a>
+    <a class="btn" href="/baseline/download_csv">Download CSV</a>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Baseline Status</h2>
+    <div class="pill">state={{ status.get('state','unknown') }}</div>
+    <div class="pill">ts={{ status.get('ts','') }}</div>
+    {% if status.get('msg') %}<div style="margin-top:8px;color:#9fb3a7;">{{ status.get('msg') }}</div>{% endif %}
+    <pre>{{ status | tojson(indent=2) }}</pre>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Detection Mode</h2>
+    <form method="post" action="/baseline/mode">
+      <label>Mode</label>
+      <select name="detect_mode">
+        <option value="threshold" {% if (cfg.get('scan',{}).get('detect_mode','threshold')=='threshold') %}selected{% endif %}>threshold (classic)</option>
+        <option value="baseline" {% if (cfg.get('scan',{}).get('detect_mode','threshold')=='baseline') %}selected{% endif %}>baseline (delta over noise floor)</option>
+      </select>
+      <label>Baseline Delta Threshold (dB)</label>
+      <input name="baseline_delta_db" type="number" step="0.1" value="{{ cfg.get('scan',{}).get('baseline_delta_db', 6.0) }}">
+      <label>Baseline File Path</label>
+      <input name="baseline_path" type="text" value="{{ cfg.get('scan',{}).get('baseline_path', baseline_path) }}">
+      <div class="btnbar">
+        <button type="submit">Save Mode</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Run Baseline Capture</h2>
+    <p style="color:#9fb3a7;margin:0 0 8px 0;">
+      This sets a flag in config; the <b>scanner</b> performs capture (so it can safely use the RTL-SDR without conflicts).
+    </p>
+    <form method="post" action="/baseline/start">
+      <label>Capture Duration (seconds)</label>
+      <input name="baseline_capture_s" type="number" step="1" value="{{ cfg.get('scan',{}).get('baseline_capture_s', 60) }}">
+      <label>Baseline File Path</label>
+      <input name="baseline_path" type="text" value="{{ cfg.get('scan',{}).get('baseline_path', baseline_path) }}">
+      <div class="btnbar">
+        <button type="submit">Start Capture</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Manage Baseline File</h2>
+
+    <form method="post" action="/baseline/clear">
+      <div class="btnbar">
+        <button class="danger" type="submit">Clear Baseline</button>
+      </div>
+    </form>
+
+    <form method="post" action="/baseline/upload" enctype="multipart/form-data">
+      <label>Upload baseline.json</label>
+      <input name="file" type="file" accept=".json,application/json">
+      <div class="btnbar">
+        <button type="submit">Upload</button>
+      </div>
+    </form>
+
+    {% if info %}
+      <h3 style="margin-top:14px;">Current Baseline Info</h3>
+      <pre>{{ info | tojson(indent=2) }}</pre>
+    {% else %}
+      <p style="color:#9fb3a7;">No baseline file found yet.</p>
+    {% endif %}
+  </div>
+
+</body>
+</html>
+"""
+
+def _baseline_info(path):
+    try:
+        b = load_baseline(path)
+        if not b:
+            return None
+        # keep it lightweight for UI
+        info = {
+            "created_utc": b.get("created_utc"),
+            "scan": b.get("scan"),
+            "device": b.get("device"),
+            "range_count": len(b.get("ranges") or []),
+            "ranges": []
+        }
+        for rr in (b.get("ranges") or [])[:12]:
+            info["ranges"].append({
+                "key": rr.get("key"),
+                "label": rr.get("label"),
+                "start_hz": rr.get("start_hz"),
+                "end_hz": rr.get("end_hz"),
+                "step_hz": rr.get("step_hz"),
+                "n": rr.get("n"),
+                "bins": len(rr.get("baseline_bins") or []),
+            })
+        return info
+    except Exception:
+        return None
+
+@app.get("/baseline")
+def baseline_page():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = str(cfg["scan"].get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+    st = load_status(DEFAULT_STATUS_PATH) or {"state":"unknown"}
+    info = _baseline_info(baseline_path)
+    return render_template_string(BASE_TPL, cfg=cfg, status=st, info=info, baseline_path=baseline_path)
+
+@app.get("/baseline/status")
+def baseline_status():
+    st = load_status(DEFAULT_STATUS_PATH) or {"state":"unknown"}
+    return (st, 200)
+
+@app.post("/baseline/mode")
+def baseline_mode():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    dm = (request.form.get("detect_mode","threshold") or "threshold").strip().lower()
+    if dm not in ("threshold","baseline"):
+        dm = "threshold"
+    cfg["scan"]["detect_mode"] = dm
+    try:
+        cfg["scan"]["baseline_delta_db"] = float(request.form.get("baseline_delta_db","6.0") or 6.0)
+    except Exception:
+        cfg["scan"]["baseline_delta_db"] = float(cfg["scan"].get("baseline_delta_db", 6.0) or 6.0)
+    bp = (request.form.get("baseline_path","") or "").strip()
+    if bp:
+        cfg["scan"]["baseline_path"] = bp
+    save_cfg(cfg)
+    return redirect(url_for("baseline_page"))
+
+@app.post("/baseline/start")
+def baseline_start():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    try:
+        cap_s = int(float(request.form.get("baseline_capture_s","60") or 60))
+    except Exception:
+        cap_s = int(cfg["scan"].get("baseline_capture_s", 60) or 60)
+    cap_s = max(10, min(cap_s, 3600))
+    cfg["scan"]["baseline_capture_s"] = cap_s
+    bp = (request.form.get("baseline_path","") or "").strip()
+    if bp:
+        cfg["scan"]["baseline_path"] = bp
+    cfg["scan"]["baseline_capture"] = True
+    save_cfg(cfg)
+    try:
+        save_status("queued", "Baseline capture queued (scanner will execute)", status_path=DEFAULT_STATUS_PATH, seconds=cap_s)
+    except Exception:
+        pass
+    return redirect(url_for("baseline_page"))
+
+@app.get("/baseline/download")
+def baseline_download():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = _resolve_baseline_path(cfg)
+    # If missing, still return to page
+    if not os.path.exists(baseline_path):
+        return redirect(url_for("baseline_page"))
+    # Minimal download without send_file dependency
+    data = open(baseline_path, "rb").read()
+    return (data, 200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+          "Pragma": "no-cache",
+          "Expires": "0",
+          "Content-Disposition": "attachment; filename=baseline.json"
+    })
+
+
+@app.get("/baseline/download_csv")
+def baseline_download_csv():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = _resolve_baseline_path(cfg)
+    if not os.path.exists(baseline_path):
+        return redirect(url_for("baseline_page"))
+
+    # Build a range-summary CSV from the baseline JSON
+    import json, io, csv
+    b = json.loads(open(baseline_path, "rb").read().decode("utf-8", errors="strict"))
+
+    created = b.get("created_utc","")
+    dev = b.get("device") or {}
+    scan = b.get("scan") or {}
+    ranges = b.get("ranges") or []
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "created_utc",
+        "ppm","gain_mode","gain_db",
+        "scan_step_hz","scan_integration_s",
+        "range_key","label","start_hz","end_hz","step_hz","n_bins","n_avg",
+        "min_db","max_db","mean_db"
+    ])
+
+    for rr in ranges:
+        bins = rr.get("baseline_bins") or []
+        if bins:
+            mn = min(bins); mx = max(bins); mu = (sum(bins)/len(bins))
+        else:
+            mn = mx = mu = ""
+        w.writerow([
+            created,
+            dev.get("ppm",""), dev.get("gain_mode",""), dev.get("gain_db",""),
+            scan.get("step_hz",""), scan.get("integration_s",""),
+            rr.get("key",""), rr.get("label",""),
+            rr.get("start_hz",""), rr.get("end_hz",""), rr.get("step_hz",""),
+            len(bins), rr.get("n",""),
+            mn, mx, mu
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+    return (data, 200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+          "Pragma": "no-cache",
+          "Expires": "0",
+          "Content-Disposition": "attachment; filename=baseline_ranges.csv"
+    })
+
+@app.post("/baseline/upload")
+def baseline_upload():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = str(cfg["scan"].get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+    f = request.files.get("file")
+    if f:
+        data = f.read()
+        try:
+            # validate JSON
+            import json
+            obj = json.loads(data.decode("utf-8", errors="strict"))
+            save_baseline(obj, path=baseline_path)
+            save_status("done", "Baseline uploaded", status_path=DEFAULT_STATUS_PATH, baseline_path=baseline_path)
+        except Exception as e:
+            try:
+                save_status("error", f"Upload failed: {e}", status_path=DEFAULT_STATUS_PATH)
+            except Exception:
+                pass
+    return redirect(url_for("baseline_page"))
+
+
+@app.get("/baseline/download_bins_csv")
+def baseline_download_bins_csv():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = _resolve_baseline_path(cfg)
+    if not os.path.exists(baseline_path):
+        return redirect(url_for("baseline_page"))
+
+    # delta used to compute per-bin threshold in baseline mode
+    try:
+        delta = float(cfg.get("scan", {}).get("baseline_delta_db", 6.0) or 6.0)
+    except Exception:
+        delta = 6.0
+
+    import json, io, csv
+    b = json.loads(open(baseline_path, "rb").read().decode("utf-8", errors="strict"))
+
+    created = b.get("created_utc","")
+    ranges = b.get("ranges") or []
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "created_utc",
+        "range_key","label",
+        "start_hz","step_hz",
+        "bin_index","freq_hz","freq_mhz",
+        "baseline_db","baseline_delta_db","threshold_db"
+    ])
+
+    for rr in ranges:
+        start = int(rr.get("start_hz", 0) or 0)
+        step  = int(rr.get("step_hz", 0) or 0)
+        key   = rr.get("key", "")
+        label = rr.get("label", "")
+        bins  = rr.get("baseline_bins") or []
+        for i, val in enumerate(bins):
+            try:
+                baseline = float(val)
+            except Exception:
+                continue
+            fhz = start + i * step
+            w.writerow([created, key, label, start, step, i, fhz, fhz/1e6, baseline, delta, baseline + delta])
+
+    data = buf.getvalue().encode("utf-8")
+    return (data, 200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+          "Pragma": "no-cache",
+          "Expires": "0",
+          "Content-Disposition": "attachment; filename=baseline_bins_with_threshold.csv"
+    })
+
+@app.post("/baseline/clear")
+def baseline_clear():
+    cfg = load_cfg()
+    cfg.setdefault("scan", {})
+    baseline_path = str(cfg["scan"].get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+    try:
+        if os.path.exists(baseline_path):
+            os.remove(baseline_path)
+    except Exception:
+        pass
+    try:
+        save_status("idle", "Baseline cleared", status_path=DEFAULT_STATUS_PATH)
+    except Exception:
+        pass
+    return redirect(url_for("baseline_page"))
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8088)

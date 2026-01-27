@@ -16,4 +16,8 @@ RF scanner that uses `rtl_power` for sweeping and emits TAK CoT + GeoChat UDP me
 3. Install systemd unit + enable service
 
 ## Version
-- Tag: v1.5.2
+- Tag: v1.5.5
+
+## Defaults (from systemd overrides)
+- Config path: `/var/lib/signalsnipe/config.json` (SIGNALSNIPE_CONFIG)
+- Web bind: `0.0.0.0:8088` (GUNICORN_BIND)

@@ -1,0 +1,2 @@
+# RTL-SDR (Realtek 0bda:2838) — allow non-root access (SignalSnipe runs as user signalsnipe)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", MODE="0666", GROUP="plugdev"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, time, uuid, socket, subprocess
+import json, os, sys, time, uuid, socket, subprocess
 import re
 try:
     import mgrs
@@ -15,6 +15,16 @@ CONFIG_PATH = os.environ.get("SIGNALSNIPE_CONFIG", "/etc/signalsnipe/config.json
 LOG_PATH = os.environ.get("SIGNALSNIPE_LOG", "/var/log/signalsnipe/signalsnipe.log")
 
 ERROR_PATH = os.environ.get("SIGNALSNIPE_ERROR", "/var/log/signalsnipe/errors.jsonl")
+
+# Ensure local app dir is on sys.path (so baseline.py imports reliably under systemd)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+from baseline import (
+    DEFAULT_BASELINE_PATH, DEFAULT_STATUS_PATH,
+    load_baseline, save_baseline, load_status, save_status, range_key
+)
 
 def _err(tag: str, msg: str, **kv):
     # Silent error sink (JSONL). Never throws.
@@ -102,6 +112,15 @@ def log(msg: str):
 def load_cfg():
     with open(CONFIG_PATH, "r") as f:
         return json.load(f)
+
+
+def save_cfg(cfg):
+    # Write atomically to the real config path
+    real_path = os.path.realpath(CONFIG_PATH)
+    tmp = real_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, real_path)
 
 def cot_xml(cfg, text: str):
     # Minimal CoT that ATAK/WINTAK will render as a marker
@@ -235,28 +254,30 @@ def send_geochat_hit(cfg, text: str):
         except Exception as e:
             _err("send_geochat", "send failed", host=host, port=port, err=repr(e))
     s.close()
-def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int, gain_db: float, ppm: int):
+def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int, gain_db: float, ppm: int, label: str = ""):
     """
     Reliable rtl_power wrapper:
     - write output to a temp file (avoids stdout buffering / partial capture issues)
     - enforce runtime with `timeout`
-    - parse ALL CSV lines (multi-hop) and choose the global strongest bin
+    - parse ALL CSV lines (multi-hop) and STITCH them into a single full-span bins array
     """
     import tempfile, os
     import signal
-    import csv
-
-    # Some rtl_power builds don't exit reliably with -1 on certain USB stacks.
-    # So we run it for a fixed window and parse the file it wrote.
     import math
+
     # Estimate hop count so wide spans get enough time to complete.
     # rtl_power typically uses ~2.5–2.8 MHz bandwidth per hop on RTL-SDR.
     span_hz = max(0, int(end_hz) - int(start_hz))
     est_bw_hz = 2_800_000
     hops = max(1, math.ceil(span_hz / est_bw_hz))
+
     # Give each hop at least integration_s seconds, plus overhead and flush time.
     timeout_s = max(15, int(hops * max(1, int(integration_s))) + 12)
-    with tempfile.NamedTemporaryFile(prefix="signalsnipe_rtlpower_", suffix=".csv", delete=False) as tf:
+
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(label or '')).strip('_')
+    pfx = "signalsnipe_rtlpower_" + (safe + "_" if safe else "")
+
+    with tempfile.NamedTemporaryFile(prefix=pfx, suffix=".csv", delete=False) as tf:
         out_path = tf.name
 
     cmd = [
@@ -305,13 +326,8 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
         except Exception:
             pass
 
-    # Parse ALL CSV lines (multi-hop), choose the global strongest bin across all lines
-    best_db = float("-inf")
-    best_start = None
-    best_end = None
-    best_step = None
-    best_bins = None
-
+    # Collect all hop lines
+    hops_rows = []
     for line in lines:
         if not line or line.startswith("#"):
             continue
@@ -320,18 +336,24 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
             continue
         parts = [x.strip() for x in line.split(",")]
         try:
-            start = float(parts[2]); end = float(parts[3]); step = float(parts[4])
-            bins = [float(x) for x in parts[6:] if x != ""]
+            import math
+            hs = float(parts[2]); he = float(parts[3]); st = float(parts[4])
+            bins = []
+            for x in parts[6:]:
+                if x == "":
+                    continue
+                try:
+                    v = float(x)
+                    bins.append(v if math.isfinite(v) else None)
+                except Exception:
+                    bins.append(None)
         except Exception:
             continue
-        if not bins:
+        if not bins or not any(v is not None for v in bins):
             continue
-        m = max(bins)
-        if m > best_db:
-            best_db = m
-            best_start, best_end, best_step, best_bins = start, end, step, bins
+        hops_rows.append((hs, he, st, bins))
 
-    if best_bins is None:
+    if not hops_rows:
         tail = "\n".join(lines[-10:]) if lines else "(no file output)"
         out_text = ""
         try:
@@ -340,12 +362,96 @@ def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int,
             pass
         raise RuntimeError(f"rtl_power produced no CSV output (rc={rc}) filetail:\n{tail}\nproc_err:\n{out_text}")
 
-    return best_start, best_end, best_step, best_bins
+    # Stitch into full-span bins
+    hops_rows.sort(key=lambda x: x[0])  # by hop start
+
+    global_start = float(hops_rows[0][0])
+    global_end   = float(max(x[1] for x in hops_rows))
+    step = float(hops_rows[0][2])
+
+    # sanity: require consistent step
+    for hs, he, st, bins in hops_rows:
+        if abs(st - step) > 1e-6:
+            raise RuntimeError(f"rtl_power hop step mismatch: got {st} expected {step}")
+
+    expected = int(round((global_end - global_start) / step)) + 1
+    out_bins = [None] * expected
+
+    def _blend(old, new):
+        # Simple overlap smoothing
+        try:
+            return (float(old) + float(new)) / 2.0
+        except Exception:
+            return new
+
+    filled_vals = []
+
+    for hs, he, st, bins in hops_rows:
+        off = int(round((hs - global_start) / step))
+        for i, v in enumerate(bins):
+            if v is None:
+                continue
+            j = off + i
+            if 0 <= j < expected:
+                if out_bins[j] is None:
+                    out_bins[j] = float(v)
+                else:
+                    out_bins[j] = _blend(out_bins[j], float(v))
+
+    # Fill any gaps with the minimum seen value (conservative, avoids explosions)
+    for v in out_bins:
+        if v is not None:
+            filled_vals.append(v)
+
+    if not filled_vals:
+        raise RuntimeError("rtl_power stitch produced no usable bins")
+
+    fill = min(filled_vals)
+    stitched = [fill if v is None else float(v) for v in out_bins]
+
+    # CLAMP/RESAMPLE: rtl_power effective bin spacing often differs from requested step_hz.
+    # Resample onto requested (start_hz:end_hz:step_hz) grid so bin counts match config.
+    target_start = float(start_hz)
+    target_end   = float(end_hz)
+    target_step  = float(step_hz)
+    target_n = int(round((target_end - target_start) / target_step)) + 1
+
+    n_src = len(stitched)
+    resampled = [0.0] * target_n
+    for i in range(target_n):
+        f = target_start + (i * target_step)
+        pos = (f - global_start) / step
+        if pos <= 0:
+            val = stitched[0]
+        elif pos >= (n_src - 1):
+            val = stitched[-1]
+        else:
+            j = int(pos)
+            frac = pos - j
+            a = stitched[j]
+            b = stitched[j + 1]
+            val = a + (b - a) * frac
+        resampled[i] = float(val)
+
+    return target_start, target_end, target_step, resampled
+
+
 def detect_peak(bins, threshold_dbfs):
     # bins are power values from rtl_power (typically dBFS-ish)
-    peak = max(bins)
-    idx = bins.index(peak)
-    return peak, idx, (peak >= threshold_dbfs)
+    import math
+    best = float("-inf")
+    best_i = 0
+    for i, v in enumerate(bins or []):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if math.isnan(fv):
+            continue
+        if fv > best:
+            best = fv
+            best_i = i
+    return best, best_i, (best >= float(threshold_dbfs))
 
 def idx_to_freq(start_hz, step_hz, idx):
     return int(start_hz + step_hz * idx)
@@ -394,13 +500,111 @@ def main():
                 time.sleep(2)
                 continue
 
+            # --- Baseline capture (survey) ---
+            if bool(scan.get("baseline_capture", False)):
+                capture_s = int(scan.get("baseline_capture_s", 60) or 60)
+                capture_s = max(10, min(capture_s, 3600))
+                raw_path = str(scan.get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+                # Label filename support: use {label} placeholder; else append label when single range
+                def _safe_label(s):
+                    s = str(s or "baseline").strip() or "baseline"
+                    return re.sub(r'[^A-Za-z0-9_.-]+', '_', s)
+                safe_label = None
+                if isinstance(ranges, list) and len(ranges) == 1 and isinstance(ranges[0], dict):
+                    safe_label = _safe_label(ranges[0].get("label"))
+                baseline_path = raw_path
+                if "{label}" in raw_path and safe_label:
+                    baseline_path = raw_path.replace("{label}", safe_label)
+                elif safe_label and raw_path.endswith('.json') and (("_" + safe_label + ".json") not in raw_path):
+                    baseline_path = raw_path[:-5] + "_" + safe_label + ".json"
+                try:
+                    save_status("running", "Baseline capture running", status_path=DEFAULT_STATUS_PATH, seconds=capture_s, baseline_path=baseline_path)
+                except Exception:
+                    pass
+                t0 = time.time()
+                accum = {}  # rk -> {n:int, mean:[float], meta:{...}}
+                try:
+                    while (time.time() - t0) < float(capture_s):
+                        for rr in (ranges or []):
+                            start_hz = int(rr["start_hz"]); end_hz = int(rr["end_hz"])
+                            label2 = rr.get("label", f"{start_hz}-{end_hz}")
+                            s_hz, e_hz, st_hz, bins = rtl_power_scan(start_hz, end_hz, step_hz, integration_s, gain_db, ppm, label2)
+                            if not bins:
+                                continue
+                            rk = range_key(start_hz, end_hz, step_hz)
+                            rec = accum.get(rk)
+                            if rec is None:
+                                accum[rk] = {"n": 1, "mean": [float(x) for x in bins], "meta": {"start_hz": start_hz, "end_hz": end_hz, "step_hz": step_hz, "label": label2}}
+                            else:
+                                n = int(rec.get("n", 1))
+                                m = rec.get("mean") or []
+                                if len(m) != len(bins):
+                                    continue
+                                n2 = n + 1
+                                for i in range(len(m)):
+                                    m[i] = (m[i]*n + float(bins[i])) / n2
+                                rec["n"] = n2
+                                rec["mean"] = m
+                                accum[rk] = rec
+                        try:
+                            save_status("running", "Baseline capture running", status_path=DEFAULT_STATUS_PATH, elapsed_s=int(time.time()-t0), baseline_path=baseline_path)
+                        except Exception:
+                            pass
+            
+                    out = {
+                        "version": 1,
+                        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "device": {"ppm": ppm, "gain_mode": gain_mode, "gain_db": gain_db},
+                        "scan": {"step_hz": step_hz, "integration_s": integration_s},
+                        "ranges": []
+                    }
+                    for rk, rec in accum.items():
+                        meta = rec.get("meta") or {}
+                        out["ranges"].append({
+                            "key": rk,
+                            "start_hz": int(meta.get("start_hz", 0)),
+                            "end_hz": int(meta.get("end_hz", 0)),
+                            "step_hz": int(meta.get("step_hz", step_hz)),
+                            "label": str(meta.get("label", "")),
+                            "n": int(rec.get("n", 0)),
+                            "baseline_bins": [float(x) for x in (rec.get("mean") or [])]
+                        })
+            
+                    save_baseline(out, path=baseline_path)
+                    try:
+                        save_status("done", "Baseline captured", status_path=DEFAULT_STATUS_PATH, baseline_path=baseline_path, ranges=len(out.get("ranges",[])))
+                    except Exception:
+                        pass
+            
+                    cfg.setdefault("scan", {})
+                    cfg["scan"]["baseline_capture"] = False
+                    save_cfg(cfg)
+                    log(f"[SignalSnipe] baseline capture complete -> {baseline_path}")
+                    time.sleep(1)
+                    continue
+                except Exception as e:
+                    try:
+                        save_status("error", f"Baseline capture failed: {e}", status_path=DEFAULT_STATUS_PATH)
+                    except Exception:
+                        pass
+                    log(f"[SignalSnipe] baseline capture failed: {e}")
+                    time.sleep(2)
+                    try:
+                        cfg.setdefault("scan", {})
+                        cfg["scan"]["baseline_capture"] = False
+                        save_cfg(cfg)
+                    except Exception:
+                        pass
+                    continue
+            # BASELINE_CAPTURE_DONE
+
             for r in ranges:
                 start_hz = int(r["start_hz"]); end_hz = int(r["end_hz"])
                 label = r.get("label", f"{start_hz}-{end_hz}")
 
                 # run one sweep for this range
                 s_hz, e_hz, st_hz, bins = rtl_power_scan(
-                    start_hz, end_hz, step_hz, integration_s, gain_db, ppm
+                    start_hz, end_hz, step_hz, integration_s, gain_db, ppm, label
                 )
                 peak, idx, over = detect_peak(bins, threshold)
                 peak_hz = idx_to_freq(s_hz, st_hz, idx)
