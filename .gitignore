@@ -1,0 +1,11 @@
+# Backup artifacts
+*.bak_*
+*.bak
+*.swp
+*~
+__pycache__/
+*.pyc
+
+# local state/logs
+/var/
+*.log
