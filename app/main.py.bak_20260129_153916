@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+import json, os, sys, time, uuid, socket, subprocess
+import re
+try:
+    import mgrs
+except Exception:
+    mgrs = None
+
+import time
+from datetime import datetime, timezone
+import socket
+import uuid
+
+CONFIG_PATH = os.environ.get("SIGNALSNIPE_CONFIG", "/etc/signalsnipe/config.json")
+LOG_PATH = os.environ.get("SIGNALSNIPE_LOG", "/var/log/signalsnipe/signalsnipe.log")
+
+ERROR_PATH = os.environ.get("SIGNALSNIPE_ERROR", "/var/log/signalsnipe/errors.jsonl")
+
+# Ensure local app dir is on sys.path (so baseline.py imports reliably under systemd)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+from baseline import (
+    DEFAULT_BASELINE_PATH, DEFAULT_STATUS_PATH,
+    load_baseline, save_baseline, load_status, save_status, range_key
+)
+
+def _err(tag: str, msg: str, **kv):
+    # Silent error sink (JSONL). Never throws.
+    try:
+        import json
+        rec = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "tag": tag, "msg": msg}
+        rec.update(kv or {})
+        with open(ERROR_PATH, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _split_hosts(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        # split on comma/space/semicolon
+        parts = re.split(r"[,\s;]+", v.strip())
+        return [p for p in (x.strip() for x in parts) if p]
+    return [str(v).strip()] if str(v).strip() else []
+
+def _targets(section: dict, default_port: int = 4242):
+    """
+    Returns list[(host,port)].
+    Accepts:
+      - section.targets = [{"host": "...", "port": 4242}, ...]
+      - section.udp_hosts = ["ip1","ip2"] (or string)
+      - section.udp_host  = "ip1,ip2 ip3"
+    """
+    sec = section or {}
+    out = []
+
+    t = sec.get("targets")
+    if isinstance(t, list):
+        for row in t:
+            if isinstance(row, dict):
+                h = str(row.get("host","") or "").strip()
+                if not h:
+                    continue
+                p = row.get("port", default_port)
+                try:
+                    p = int(p)
+                except Exception:
+                    p = default_port
+                out.append((h, p))
+
+    # If no explicit targets, fall back to udp_hosts/udp_host + udp_port
+    if not out:
+        hosts = sec.get("udp_hosts", None)
+        if hosts is None:
+            hosts = sec.get("udp_host", None)
+        host_list = _split_hosts(hosts)
+        p = sec.get("udp_port", default_port)
+        try:
+            p = int(p)
+        except Exception:
+            p = default_port
+        out = [(h, p) for h in host_list]
+
+    # De-dupe while preserving order
+    seen = set()
+    dedup = []
+    for h,p in out:
+        key = (h,p)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((h,p))
+    return dedup
+
+
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"{ts} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def load_cfg():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+
+def save_cfg(cfg):
+    # Write atomically to the real config path
+    real_path = os.path.realpath(CONFIG_PATH)
+    tmp = real_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, real_path)
+
+def cot_xml(cfg, text: str):
+    # Minimal CoT that ATAK/WINTAK will render as a marker
+    now = datetime.now(timezone.utc)
+    t = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = (now.timestamp() + 120)
+    stale_t = datetime.fromtimestamp(stale, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    uid_prefix = cfg.get('cot',{}).get('uid_prefix','SIGNALSNIPE')
+    # Stable UID prevents multiple tracks; allow explicit override via cfg.cot.uid
+    uid = str(cfg.get('cot',{}).get('uid','')).strip()
+    if not uid:
+        base = cfg.get('meta',{}).get('sensor_name') or cfg.get('cot',{}).get('callsign','RF-SENSOR')
+        base = re.sub(r'[^A-Za-z0-9_.-]+', '-', str(base)).strip('-') or 'SENSOR'
+        uid = f"{uid_prefix}-{base}"
+    callsign = cfg["cot"].get("callsign", "RF-SENSOR")
+    loc = cfg.get('location',{}) or {}
+    lat = float(loc.get('lat', 35.0))
+    lon = float(loc.get('lon', -78.0))
+    # If user provides MGRS and selects manual_mgrs, convert to lat/lon
+    if str(loc.get('mode','')).strip() == 'manual_mgrs':
+        m_raw = str(loc.get('mgrs','') or '').strip().upper()
+        m_norm = ''
+        parts = m_raw.split()
+        # Prefer token form: '18S TH 50148 022640' (we'll equalize precision)
+        if len(parts) >= 4:
+            zb, sq = parts[0], parts[1]
+            e = ''.join([c for c in parts[2] if c.isdigit()])
+            n = ''.join([c for c in parts[3] if c.isdigit()])
+            prec = min(len(e), len(n), 5)
+            if prec > 0:
+                m_norm = '%s%s%s%s' % (zb, sq, e[:prec], n[:prec])
+        if not m_norm:
+            # Fallback: compact form; strip whitespace
+            m_norm = ''.join(m_raw.split())
+            # If trailing digits are odd length, drop the last digit
+            if len(m_norm) > 5:
+                tail = m_norm[5:]
+                if len(tail) % 2 == 1:
+                    m_norm = m_norm[:-1]
+        if m_norm and mgrs is not None:
+            try:
+                lat2, lon2 = mgrs.MGRS().toLatLon(m_norm)
+                lat = float(lat2); lon = float(lon2)
+            except Exception as e:
+                try:
+                    log("[SignalSnipe] MGRS parse failed: '%s' -> '%s' err=%r" % (m_raw, m_norm, e))
+                except Exception:
+                    pass
+    remarks = text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    return (
+        f'<event version="2.0" uid="{uid}" type="b-m-p-s-p-loc" how="m-g" '
+        f'time="{t}" start="{t}" stale="{stale_t}">'
+        f'<point lat="{lat}" lon="{lon}" hae="9999999" ce="9999999" le="9999999"/>'
+        f'<detail><contact callsign="{callsign}"/>'
+        f'<remarks>{remarks}</remarks></detail></event>'
+    ).encode("utf-8")
+
+def send_cot(cfg, text: str):
+    if not cfg.get("cot", {}).get("enabled", True):
+        return
+    cot_sec = cfg.get("cot", {}) or {}
+    targets = _targets(cot_sec, 4242)
+    if not targets:
+        return
+
+    payload = cot_xml(cfg, text)
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(payload, (host, int(port)))
+            s.close()
+        except Exception as e:
+            _err("send_cot", "send failed", host=host, port=port, err=repr(e))
+
+
+
+def send_geochat_hit(cfg, text: str):
+    """
+    Send TAK GeoChat CoT (b-t-f) via UDP.
+    This is shaped to look like common ATAK/WinTAK GeoChat CoT.
+    """
+    chat = cfg.get("chat", {}) or {}
+    if not chat.get("enabled", False):
+        return
+
+    targets = _targets(chat, 4242)
+    if not targets:
+        return
+
+    room = str(chat.get("chatroom", "SignalSnipe")).strip() or "SignalSnipe"
+    from_callsign = str(chat.get("from_callsign", "SignalSnipe")).strip() or "SignalSnipe"
+    to_uid = str(chat.get("to_uid", "")).strip()  # optional (directed)
+
+    # Stable sender UID (so chat sender stays consistent)
+    uid_prefix = cfg.get('cot',{}).get('uid_prefix','SIGNALSNIPE')
+    base = cfg.get('meta',{}).get('sensor_name') or cfg.get('cot',{}).get('callsign','RF-SENSOR')
+    base = re.sub(r'[^A-Za-z0-9_.-]+', '-', str(base)).strip('-') or 'SENSOR'
+    sender_uid = f"{uid_prefix}-{base}"
+
+    now = datetime.now(timezone.utc)
+    t = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = datetime.fromtimestamp(now.timestamp() + 86400, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Event uid in a GeoChat-ish style
+    ev_uid = f"GeoChat.{sender_uid}.{room}.{uuid.uuid4()}"
+    msg = (text or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    # Optional directed message (receiverUid) + marti dest
+    rx_attr = f' receiverUid="{to_uid}"' if to_uid else ""
+    marti = f'<marti><dest uid="{to_uid}"/></marti>' if to_uid else ""
+
+    # Many clients use lat/lon 0,0 for chat events; location belongs in separate CoT tracks.
+    xml = (
+        f'<event version="2.0" uid="{ev_uid}" type="b-t-f" time="{t}" start="{t}" stale="{stale}" how="h-g-i-g-o">'
+        f'<point lat="0" lon="0" hae="9999999" ce="9999999" le="9999999" />'
+        f'<detail>'
+        f'<__chat id="{room}" chatroom="{room}" senderCallsign="{from_callsign}" groupOwner="false"{rx_attr}>'
+        f'</__chat>'
+        f'<link uid="{sender_uid}" type="a-f-G-U-C-I" relation="p-p" />'
+        f'<remarks source="BAO.F.{from_callsign}.{sender_uid}" sourceID="{sender_uid}" to="{room}" time="{t}">{msg}</remarks>'
+        f'{marti}'
+        f'</detail>'
+        f'</event>'
+    )
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for host, port in targets:
+        try:
+            s.sendto(xml.encode("utf-8"), (host, int(port)))
+        except Exception as e:
+            _err("send_geochat", "send failed", host=host, port=port, err=repr(e))
+    s.close()
+def rtl_power_scan(start_hz: int, end_hz: int, step_hz: int, integration_s: int, gain_db: float, ppm: int, label: str = ""):
+    """
+    Reliable rtl_power wrapper:
+    - write output to a temp file (avoids stdout buffering / partial capture issues)
+    - enforce runtime with `timeout`
+    - parse ALL CSV lines (multi-hop) and STITCH them into a single full-span bins array
+    """
+    import tempfile, os
+    import signal
+    import math
+
+    # Estimate hop count so wide spans get enough time to complete.
+    # rtl_power typically uses ~2.5–2.8 MHz bandwidth per hop on RTL-SDR.
+    span_hz = max(0, int(end_hz) - int(start_hz))
+    est_bw_hz = 2_800_000
+    hops = max(1, math.ceil(span_hz / est_bw_hz))
+
+    # Give each hop at least integration_s seconds, plus overhead and flush time.
+    timeout_s = max(15, int(hops * max(1, int(integration_s))) + 12)
+
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(label or '')).strip('_')
+    pfx = "signalsnipe_rtlpower_" + (safe + "_" if safe else "")
+
+    with tempfile.NamedTemporaryFile(prefix=pfx, suffix=".csv", delete=False) as tf:
+        out_path = tf.name
+
+    cmd = [
+        "timeout", "-k", "30", "-s", "INT", str(timeout_s),
+        "rtl_power",
+        "-f", f"{start_hz}:{end_hz}:{step_hz}",
+        "-i", str(integration_s),
+        "-1",
+        "-p", str(ppm),
+        "-g", str(gain_db),
+        out_path,
+    ]
+
+    err = b""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
+        )
+        try:
+            err = (proc.communicate(timeout=timeout_s)[1] or b"")
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except Exception:
+                pass
+            try:
+                err = (proc.communicate(timeout=10)[1] or b"")
+            except Exception:
+                err = b""
+        rc = proc.returncode if proc.returncode is not None else -9
+    except KeyboardInterrupt:
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except Exception:
+            pass
+        raise
+
+    try:
+        lines = open(out_path, "r", errors="ignore").read().splitlines()
+    finally:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+
+    # Collect all hop lines
+    hops_rows = []
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        # crude CSV sanity: must have many commas and date-like prefix
+        if line.count(",") <= 6 or not line[0:4].isdigit():
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        try:
+            import math
+            hs = float(parts[2]); he = float(parts[3]); st = float(parts[4])
+            bins = []
+            for x in parts[6:]:
+                if x == "":
+                    continue
+                try:
+                    v = float(x)
+                    bins.append(v if math.isfinite(v) else None)
+                except Exception:
+                    bins.append(None)
+        except Exception:
+            continue
+        if not bins or not any(v is not None for v in bins):
+            continue
+        hops_rows.append((hs, he, st, bins))
+
+    if not hops_rows:
+        tail = "\n".join(lines[-10:]) if lines else "(no file output)"
+        out_text = ""
+        try:
+            out_text = (err or b"").decode("utf-8", "ignore").strip()
+        except Exception:
+            pass
+        raise RuntimeError(f"rtl_power produced no CSV output (rc={rc}) filetail:\n{tail}\nproc_err:\n{out_text}")
+
+    # Stitch into full-span bins
+    hops_rows.sort(key=lambda x: x[0])  # by hop start
+
+    global_start = float(hops_rows[0][0])
+    global_end   = float(max(x[1] for x in hops_rows))
+    step = float(hops_rows[0][2])
+
+    # sanity: require consistent step
+    for hs, he, st, bins in hops_rows:
+        if abs(st - step) > 1e-6:
+            raise RuntimeError(f"rtl_power hop step mismatch: got {st} expected {step}")
+
+    expected = int(round((global_end - global_start) / step)) + 1
+    out_bins = [None] * expected
+
+    def _blend(old, new):
+        # Simple overlap smoothing
+        try:
+            return (float(old) + float(new)) / 2.0
+        except Exception:
+            return new
+
+    filled_vals = []
+
+    for hs, he, st, bins in hops_rows:
+        off = int(round((hs - global_start) / step))
+        for i, v in enumerate(bins):
+            if v is None:
+                continue
+            j = off + i
+            if 0 <= j < expected:
+                if out_bins[j] is None:
+                    out_bins[j] = float(v)
+                else:
+                    out_bins[j] = _blend(out_bins[j], float(v))
+
+    # Fill any gaps with the minimum seen value (conservative, avoids explosions)
+    for v in out_bins:
+        if v is not None:
+            filled_vals.append(v)
+
+    if not filled_vals:
+        raise RuntimeError("rtl_power stitch produced no usable bins")
+
+    fill = min(filled_vals)
+    stitched = [fill if v is None else float(v) for v in out_bins]
+
+    # CLAMP/RESAMPLE: rtl_power effective bin spacing often differs from requested step_hz.
+    # Resample onto requested (start_hz:end_hz:step_hz) grid so bin counts match config.
+    target_start = float(start_hz)
+    target_end   = float(end_hz)
+    target_step  = float(step_hz)
+    target_n = int(round((target_end - target_start) / target_step)) + 1
+
+    n_src = len(stitched)
+    resampled = [0.0] * target_n
+    for i in range(target_n):
+        f = target_start + (i * target_step)
+        pos = (f - global_start) / step
+        if pos <= 0:
+            val = stitched[0]
+        elif pos >= (n_src - 1):
+            val = stitched[-1]
+        else:
+            j = int(pos)
+            frac = pos - j
+            a = stitched[j]
+            b = stitched[j + 1]
+            val = a + (b - a) * frac
+        resampled[i] = float(val)
+
+    return target_start, target_end, target_step, resampled
+
+
+def detect_peak(bins, threshold_dbfs):
+    # bins are power values from rtl_power (typically dBFS-ish)
+    import math
+    best = float("-inf")
+    best_i = 0
+    for i, v in enumerate(bins or []):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if math.isnan(fv):
+            continue
+        if fv > best:
+            best = fv
+            best_i = i
+    return best, best_i, (best >= float(threshold_dbfs))
+
+def idx_to_freq(start_hz, step_hz, idx):
+    return int(start_hz + step_hz * idx)
+
+def main():
+    log("[SignalSnipe] starting")
+    last_alert = {}  # key -> last_time
+    consecutive = {} # key -> seconds above threshold
+
+    # Heartbeat init (persistent across iterations)
+    heartbeat_s = 60
+    next_hb = 0.0
+
+    while True:
+        try:
+            cfg = load_cfg()
+
+            # --- Heartbeat tick (ONE sensor track) ---
+            heartbeat_s = int(cfg.get('cot',{}).get('heartbeat_s', 60) or 60)
+            now_ts = time.time()
+            if now_ts >= next_hb:
+                try:
+                    nm = cfg.get('meta',{}).get('sensor_name','SignalSnipe')
+                    send_cot(cfg, 'SENSOR %s online' % nm)
+                except Exception:
+                    pass
+                next_hb = now_ts + heartbeat_s
+
+            # --- Pull scan + device config ---
+            scan = cfg.get("scan", {}) or {}
+            dev  = cfg.get("device", {}) or {}
+
+            step_hz       = int(scan.get("step_hz", 25000))
+            integration_s = int(scan.get("integration_s", 2))
+            threshold     = float(scan.get("threshold_dbfs", scan.get("threshold", -35)))
+            min_dur       = int(scan.get("min_dur_s", 4))
+            cooldown      = int(scan.get("cooldown_s", 30))
+
+            ppm = int(dev.get("ppm", 0) or 0)
+            gain_mode = dev.get("gain_mode", "manual")
+            gain_db = float(dev.get("gain_db", 20.7)) if gain_mode == "manual" else 0.0
+
+            ranges = scan.get("ranges", []) or []
+            if not ranges:
+                log("[SignalSnipe] no ranges configured; sleeping")
+                time.sleep(2)
+                continue
+
+            # --- Baseline capture (survey) ---
+            if bool(scan.get("baseline_capture", False)):
+                capture_s = int(scan.get("baseline_capture_s", 60) or 60)
+                capture_s = max(10, min(capture_s, 3600))
+                raw_path = str(scan.get("baseline_path", DEFAULT_BASELINE_PATH) or DEFAULT_BASELINE_PATH).strip() or DEFAULT_BASELINE_PATH
+                # Label filename support: use {label} placeholder; else append label when single range
+                def _safe_label(s):
+                    s = str(s or "baseline").strip() or "baseline"
+                    return re.sub(r'[^A-Za-z0-9_.-]+', '_', s)
+                safe_label = None
+                if isinstance(ranges, list) and len(ranges) == 1 and isinstance(ranges[0], dict):
+                    safe_label = _safe_label(ranges[0].get("label"))
+                baseline_path = raw_path
+                if "{label}" in raw_path and safe_label:
+                    baseline_path = raw_path.replace("{label}", safe_label)
+                elif safe_label and raw_path.endswith('.json') and (("_" + safe_label + ".json") not in raw_path):
+                    baseline_path = raw_path[:-5] + "_" + safe_label + ".json"
+                try:
+                    save_status("running", "Baseline capture running", status_path=DEFAULT_STATUS_PATH, seconds=capture_s, baseline_path=baseline_path)
+                except Exception:
+                    pass
+                t0 = time.time()
+                accum = {}  # rk -> {n:int, mean:[float], meta:{...}}
+                try:
+                    while (time.time() - t0) < float(capture_s):
+                        for rr in (ranges or []):
+                            start_hz = int(rr["start_hz"]); end_hz = int(rr["end_hz"])
+                            label2 = rr.get("label", f"{start_hz}-{end_hz}")
+                            s_hz, e_hz, st_hz, bins = rtl_power_scan(start_hz, end_hz, step_hz, integration_s, gain_db, ppm, label2)
+                            if not bins:
+                                continue
+                            rk = range_key(start_hz, end_hz, step_hz)
+                            rec = accum.get(rk)
+                            if rec is None:
+                                accum[rk] = {"n": 1, "mean": [float(x) for x in bins], "meta": {"start_hz": start_hz, "end_hz": end_hz, "step_hz": step_hz, "label": label2}}
+                            else:
+                                n = int(rec.get("n", 1))
+                                m = rec.get("mean") or []
+                                if len(m) != len(bins):
+                                    continue
+                                n2 = n + 1
+                                for i in range(len(m)):
+                                    m[i] = (m[i]*n + float(bins[i])) / n2
+                                rec["n"] = n2
+                                rec["mean"] = m
+                                accum[rk] = rec
+                        try:
+                            save_status("running", "Baseline capture running", status_path=DEFAULT_STATUS_PATH, elapsed_s=int(time.time()-t0), baseline_path=baseline_path)
+                        except Exception:
+                            pass
+            
+                    out = {
+                        "version": 1,
+                        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "device": {"ppm": ppm, "gain_mode": gain_mode, "gain_db": gain_db},
+                        "scan": {"step_hz": step_hz, "integration_s": integration_s},
+                        "ranges": []
+                    }
+                    for rk, rec in accum.items():
+                        meta = rec.get("meta") or {}
+                        out["ranges"].append({
+                            "key": rk,
+                            "start_hz": int(meta.get("start_hz", 0)),
+                            "end_hz": int(meta.get("end_hz", 0)),
+                            "step_hz": int(meta.get("step_hz", step_hz)),
+                            "label": str(meta.get("label", "")),
+                            "n": int(rec.get("n", 0)),
+                            "baseline_bins": [float(x) for x in (rec.get("mean") or [])]
+                        })
+            
+                    save_baseline(out, path=baseline_path)
+                    try:
+                        save_status("done", "Baseline captured", status_path=DEFAULT_STATUS_PATH, baseline_path=baseline_path, ranges=len(out.get("ranges",[])))
+                    except Exception:
+                        pass
+            
+                    cfg.setdefault("scan", {})
+                    cfg["scan"]["baseline_capture"] = False
+                    save_cfg(cfg)
+                    log(f"[SignalSnipe] baseline capture complete -> {baseline_path}")
+                    time.sleep(1)
+                    continue
+                except Exception as e:
+                    try:
+                        save_status("error", f"Baseline capture failed: {e}", status_path=DEFAULT_STATUS_PATH)
+                    except Exception:
+                        pass
+                    log(f"[SignalSnipe] baseline capture failed: {e}")
+                    time.sleep(2)
+                    try:
+                        cfg.setdefault("scan", {})
+                        cfg["scan"]["baseline_capture"] = False
+                        save_cfg(cfg)
+                    except Exception:
+                        pass
+                    continue
+            # BASELINE_CAPTURE_DONE
+
+            for r in ranges:
+                start_hz = int(r["start_hz"]); end_hz = int(r["end_hz"])
+                label = r.get("label", f"{start_hz}-{end_hz}")
+
+                # run one sweep for this range
+                s_hz, e_hz, st_hz, bins = rtl_power_scan(
+                    start_hz, end_hz, step_hz, integration_s, gain_db, ppm, label
+                )
+                peak, idx, over = detect_peak(bins, threshold)
+                peak_hz = idx_to_freq(s_hz, st_hz, idx)
+
+                key = f"{label}:{peak_hz}"
+                now = time.time()
+
+                if over:
+                    consecutive[key] = consecutive.get(key, 0) + integration_s
+                else:
+                    consecutive[key] = 0
+
+                # fire alert if above threshold long enough AND cooldown elapsed
+                if consecutive[key] >= min_dur:
+                    last = last_alert.get(key, 0)
+                    if now - last >= cooldown:
+                        msg = (f"DETECT {label} peak={peak:.1f} dB "
+                               f"freq≈{peak_hz/1e6:.6f} MHz dur={consecutive[key]}s "
+                               f"thr={threshold} step={step_hz} gain={gain_db}")
+                        try:
+                            send_geochat_hit(cfg, msg)
+                            log(f"[SignalSnipe] CHAT sent -> {cfg.get('chat',{}).get('udp_host') or cfg.get('cot',{}).get('udp_host')}:{cfg.get('chat',{}).get('udp_port') or cfg.get('cot',{}).get('udp_port')} room={cfg.get('chat',{}).get('chatroom','SignalSnipe')} target={'broadcast' if not cfg.get('chat',{}).get('to_uid') else cfg.get('chat',{}).get('to_uid')}")
+                        except Exception as e:
+                            log(f"[SignalSnipe] CHAT error: {e}")
+                        log(msg)
+                        last_alert[key] = now
+                        consecutive[key] = 0
+
+        except KeyboardInterrupt:
+
+            log("[SignalSnipe] stop requested")
+
+            return
+
+
+        except Exception as e:
+            log(f"[SignalSnipe] ERROR: {e}")
+            time.sleep(2)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
