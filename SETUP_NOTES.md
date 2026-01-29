@@ -2,7 +2,7 @@
 
 ## Timestamp
 ```
-2026-01-29T18:25:25.278057
+2026-01-29T18:29:51
 ```
 
 ## System
@@ -31,10 +31,19 @@ UBUNTU_CODENAME=jammy
 
 ## APT Packages (useful subset)
 ```
-awk: cmd. line:1: {print $2\" \" $3}
-awk: cmd. line:1:          ^ backslash not last character on line
-awk: cmd. line:1: {print $2\" \" $3}
-awk: cmd. line:1:          ^ syntax error
+build-essential 12.9ubuntu3
+curl 7.81.0-1ubuntu1.21
+g++ 4:11.2.0-1ubuntu1
+gcc 4:11.2.0-1ubuntu1
+git 1:2.34.1-1ubuntu1.15
+make 4.3-4.1build1
+network-manager 1.36.6-0ubuntu2.2
+python3 3.10.6-1~22.04.1
+python3-pip 22.0.2+dfsg-1ubuntu0.7
+python3-venv 3.10.6-1~22.04.1
+rsync 3.2.7-0ubuntu0.22.04.4
+rtl-sdr 0.6.0-4
+usbutils 1:014-1build1
 ```
 
 ## Python (SignalSnipe venv)
@@ -55,43 +64,20 @@ Werkzeug==3.1.5
 
 ## systemd Units
 ```
-Failed to list unit files: Connection timed out
+(unable to list or none found)
 ```
 
 ### signalsnipe-web.service
 ```
-
+(empty/unavailable)
 ```
 
 ### signalsnipe-scan.service
 ```
-# /etc/systemd/system/signalsnipe-scan.service
-[Unit]
-Description=SignalSnipe RF Scanner (rtl_power + detection + CoT)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=signalsnipe
-Group=signalsnipe
-ExecStart=/opt/signalsnipe/run-scan.sh
-Restart=always
-RestartSec=2
-Nice=-5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-
-# /etc/systemd/system/signalsnipe-scan.service.d/override.conf
-[Service]
-Environment=SIGNALSNIPE_CONFIG=/var/lib/signalsnipe/config.json
+(empty/unavailable)
 ```
 
 ## Config file
 ```
 -rw-r--r-- 1 signalsnipe signalsnipe 1767 Jan 29 17:05 /var/lib/signalsnipe/config.json
 ```
-
