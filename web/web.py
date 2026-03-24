@@ -390,6 +390,29 @@ a.navbtn:hover{ background: rgba(255,255,255,.10); }
   </div>
 
 
+      <div class="card">
+        <h2 style="margin:0 0 6px 0;">Function</h2>
+        <div class="mini">Choose which SignalSnipe function currently owns the SDR hardware.</div>
+
+        <div class="row">
+          <div>
+            <label>Active Function</label>
+            <select name="active_function">
+              <option value="sweep" {% if cfg.get('function',{}).get('active','sweep') == 'sweep' %}selected{% endif %}>Sweep</option>
+              <option value="csdr" {% if cfg.get('function',{}).get('active','sweep') == 'csdr' %}selected{% endif %}>CSDR</option>
+            </select>
+          </div>
+          <div>
+            <label>Current SDR Type</label>
+            <input value="{{cfg.get('device',{}).get('type','rtlsdr')}}" readonly />
+          </div>
+        </div>
+
+        <div class="mini" style="margin-top:10px;">
+          Sweep uses the existing rtl_power path and configured multi-range sweeps. CSDR mode reserves the SDR for a narrower future CSDR worker and pauses the current sweep loop.
+        </div>
+      </div>
+
     <div class="card">
       <h2 style="margin:0 0 6px 0;">RF Scan</h2>
 
@@ -479,6 +502,30 @@ a.navbtn:hover{ background: rgba(255,255,255,.10); }
         Tip: huge spans + tiny steps are heavy. Start with a few ranges and tune threshold/duration first.
       </div>
     </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 6px 0;">CSDR Function</h2>
+        <div class="mini">This is the narrower analysis window reserved for the future CSDR worker. It does not replace your Sweep ranges.</div>
+
+        <div class="row">
+          <div>
+            <div class="mhz-suffix">
+              <label>CSDR Start</label>
+              <input name="csdr_start_mhz" value="{{cfg.get('csdr',{}).get('start_mhz','')}}" inputmode="decimal" placeholder="e.g. 433.800"/>
+            </div>
+            <div class="mhz-suffix">
+              <label>CSDR End</label>
+              <input name="csdr_end_mhz" value="{{cfg.get('csdr',{}).get('end_mhz','')}}" inputmode="decimal" placeholder="e.g. 434.200"/>
+            </div>
+          </div>
+          <div>
+            <label>CSDR Label</label>
+            <input name="csdr_label" value="{{cfg.get('csdr',{}).get('label','CSDR Window')}}" placeholder="e.g. ISM Burst Window"/>
+            <label>CSDR Sample Rate (Hz)</label>
+            <input name="csdr_sample_rate" value="{{cfg.get('csdr',{}).get('sample_rate',256000)}}" type="number" step="1"/>
+          </div>
+        </div>
+      </div>
 
     <div class="card">
       <h2 style="margin:0 0 6px 0;">Location / Meta</h2>
@@ -757,6 +804,19 @@ def index():
         })
     cfg.setdefault("cot", {})
     cfg.setdefault("chat", {})
+    cfg.setdefault("function", {})
+    cfg["function"].setdefault("active", "sweep")
+    cfg.setdefault("csdr", {})
+    try:
+        csdr_start = int(cfg.get("csdr", {}).get("start_hz", 0) or 0)
+        csdr_end = int(cfg.get("csdr", {}).get("end_hz", 0) or 0)
+        cfg["csdr"]["start_mhz"] = hz_to_mhz_str(csdr_start) if csdr_start > 0 else str(cfg["csdr"].get("start_mhz","") or "")
+        cfg["csdr"]["end_mhz"] = hz_to_mhz_str(csdr_end) if csdr_end > 0 else str(cfg["csdr"].get("end_mhz","") or "")
+    except Exception:
+        cfg["csdr"]["start_mhz"] = str(cfg.get("csdr", {}).get("start_mhz","") or "")
+        cfg["csdr"]["end_mhz"] = str(cfg.get("csdr", {}).get("end_mhz","") or "")
+    cfg["csdr"].setdefault("label", "CSDR Window")
+    cfg["csdr"].setdefault("sample_rate", 256000)
     # extra targets = cfg targets excluding the default host/port
     try:
         dch = str(cfg["cot"].get("udp_host","")).strip()
@@ -784,6 +844,9 @@ def save():
     cfg.setdefault("location", {})
     cfg.setdefault("meta", {})
     cfg.setdefault("cot", {})
+    cfg.setdefault("chat", {})
+    cfg.setdefault("function", {})
+    cfg.setdefault("csdr", {})
 
     def _get(name, default=None):
         v = request.form.get(name, None)
@@ -892,6 +955,24 @@ def save():
             })
 
     cfg["scan"]["ranges"] = new_ranges
+
+    active_function = (_get("active_function", cfg.get("function", {}).get("active", "sweep")) or "sweep").strip().lower()
+    if active_function not in ("sweep", "csdr"):
+        active_function = "sweep"
+    cfg.setdefault("function", {})
+    cfg["function"]["active"] = active_function
+
+    cfg.setdefault("csdr", {})
+    csdr_start_mhz = str(_get("csdr_start_mhz", cfg.get("csdr", {}).get("start_mhz", "")) or "").strip()
+    csdr_end_mhz = str(_get("csdr_end_mhz", cfg.get("csdr", {}).get("end_mhz", "")) or "").strip()
+    csdr_start_hz = mhz_str_to_hz(csdr_start_mhz) if csdr_start_mhz else 0
+    csdr_end_hz = mhz_str_to_hz(csdr_end_mhz) if csdr_end_mhz else 0
+    cfg["csdr"]["start_mhz"] = csdr_start_mhz
+    cfg["csdr"]["end_mhz"] = csdr_end_mhz
+    cfg["csdr"]["start_hz"] = int(csdr_start_hz) if csdr_start_hz > 0 else 0
+    cfg["csdr"]["end_hz"] = int(csdr_end_hz) if csdr_end_hz > 0 else 0
+    cfg["csdr"]["label"] = _get("csdr_label", cfg.get("csdr", {}).get("label", "CSDR Window")) or "CSDR Window"
+    cfg["csdr"]["sample_rate"] = _as_int("csdr_sample_rate", cfg.get("csdr", {}).get("sample_rate", 256000))
     # Build CoT/Chat targets from UI rows (default + extras), run LAST so it persists
     try:
         # ---- CoT ----

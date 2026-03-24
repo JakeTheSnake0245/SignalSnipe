@@ -499,6 +499,13 @@ def detect_peak(bins, threshold_dbfs):
 def idx_to_freq(start_hz, step_hz, idx):
     return int(start_hz + step_hz * idx)
 
+def current_function(cfg):
+    try:
+        fn = str((cfg or {}).get("function", {}).get("active", "sweep")).strip().lower()
+        return fn if fn in ("sweep", "csdr") else "sweep"
+    except Exception:
+        return "sweep"
+
 def main():
     log("[SignalSnipe] starting")
     last_alert = {}  # key -> last_time
@@ -511,6 +518,12 @@ def main():
     while True:
         try:
             cfg = load_cfg()
+
+            active_function = current_function(cfg)
+            if active_function == "csdr":
+                log("[SignalSnipe] function=csdr; sweep scanner idle, SDR reserved for CSDR mode")
+                time.sleep(2)
+                continue
 
             # --- Heartbeat tick (ONE sensor track) ---
             heartbeat_s = int(cfg.get('cot',{}).get('heartbeat_s', 60) or 60)
